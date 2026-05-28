@@ -11,13 +11,14 @@ Because `*.env` in `.gitignore` is easy to forget. And secrets in git history? T
 ## Features
 
 - **AES-256-GCM** authenticated encryption with Scrypt key derivation
+- **Multi-profile support** — manage `production`, `staging`, `dev` configs in one repo
+- **`.env` diff viewer** — compare key names between two encrypted files without exposing values
+- **Key/value audit** — list all keys, verify required keys exist, without decrypting
+- **Git hook integration** — one command to block plaintext `.env` commits permanently
+- **`.envvaultrc` config** — define profiles, paths, defaults per project so you never type flags twice
+- **Watch mode** — auto re-encrypts on save during development
 - **Integrity checksum** — detects tampering or corruption
-- **Password confirmation** on encrypt to prevent typos
-- **Safe overwrite** prompts when output file already exists
 - **Password rotation** — re-encrypt with a new password without manual steps
-- **File metadata** embedded in the encrypted blob (original filename, timestamp, checksum)
-- **Status command** — inspect encrypted files without decrypting
-- Single zero-dependency file (only needs `cryptography` package)
 
 ## Installation
 
@@ -25,7 +26,7 @@ Because `*.env` in `.gitignore` is easy to forget. And secrets in git history? T
 pip install cryptography
 ```
 
-Or clone and use directly:
+Or:
 
 ```bash
 git clone https://github.com/IndraTensei/envault.git
@@ -37,36 +38,79 @@ python envault.py encrypt .env
 ## Quick Start
 
 ```bash
-# Encrypt your .env file
-python envault.py encrypt .env
-# Enter password: ******
-# Confirm: ******
-# → .env.enc created
+# 1. Initialize config (auto-detects .env files)
+envault init
 
-# Decrypt it back
-python envault.py decrypt .env.enc
-# Enter password: ******
-# → .env restored
+# 2. Encrypt your main .env
+envault encrypt .env
 
-# Check file info without decrypting
-python envault.py status .env.enc
+# 3. Encrypt with profile
+envault encrypt .env --profile production
+# → .env.enc.production
 
-# Change the password
-python envault.py rotate .env.enc
+# 4. Decrypt
+envault decrypt .env.enc
+envault decrypt .env.enc.production -o .env
+
+# 5. Compare keys between two environments (no values exposed!)
+envault diff .env.enc .env.enc.production
+
+# 6. Audit — verify all expected keys are present
+envault audit .env.enc --expect DATABASE_URL API_KEY REDIS_URL
+
+# 7. Block plaintext .env commits permanently
+envault install-hooks
+
+# 8. Watch mode — auto re-encrypt on save
+envault watch .env --interval 2
+
+# 9. Rotate password
+envault rotate .env.enc
+
+# 10. Check file info without decrypting
+envault status .env.enc
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `encrypt [.env] [-o out]` | Encrypt a file (default: `.env` → `.env.enc`) |
+| `init` | Create `.envvaultrc` with auto-detected profiles |
+| `encrypt <file> [--profile <name>] [-o out]` | Encrypt a file |
 | `decrypt <file> [-o out]` | Decrypt a file |
 | `status <file>` | Show encrypted file metadata |
 | `rotate <file>` | Re-encrypt with a new password |
+| `diff <file1> <file2>` | Compare key names between files |
+| `audit <file> [--expect KEY ...]` | List keys, optionally verify expected set |
+| `install-hooks` | Install git pre-commit hook |
+| `watch <file> [--interval N]` | Auto re-encrypt on change |
+
+## Multi-Profile Workflow
+
+```bash
+# .envvaultrc
+{
+  "profiles": {
+    "production": {
+      "source": ".env",
+      "encrypted": ".env.enc.production"
+    },
+    "staging": {
+      "source": ".env",
+      "encrypted": ".env.enc.staging"
+    }
+  }
+}
+
+# Encrypt each profile
+envault encrypt .env --profile production   → .env.enc.production
+envault encrypt .env --profile staging      → .env.enc.staging
+
+# Compare what's different
+envault diff .env.enc.production .env.enc.staging
+```
 
 ## File Format
-
-The encrypted file has this structure:
 
 ```
 [MAGIC: 4 bytes "ENVA"]
@@ -74,18 +118,27 @@ The encrypted file has this structure:
 [NONCE: 12 bytes]
 [CIPHERTEXT: variable]
   └── [METADATA_LEN: 4 bytes]
-  └── [METADATA: JSON]
+  └── [METADATA: JSON (checksum, filename, timestamp, profile)]
   └── [PLAINTEXT: your file content]
 ```
 
 All crypto uses **AES-256-GCM** with a key derived via **Scrypt** (N=131072, r=8, p=1).
 
-## Usage in CI/CD
+## Git Pre-Commit Hook
 
-```bash
-# Store encrypted env + password as CI secrets
-envault decrypt .env.enc -o .env
+Once installed with `envault install-hooks`, any attempt to commit a plaintext `.env` file will be blocked:
+
 ```
+🚫 envault: blocked commit — plaintext .env files staged:
+   ❌ .env
+
+   Encrypt them first:
+     envault encrypt .env
+
+   Or bypass with: git commit --no-verify
+```
+
+Bypass available with `--no-verify` for emergencies.
 
 ## License
 

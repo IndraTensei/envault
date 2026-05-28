@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "profiles": {
+    "default": {
+      "source": ".env",
+      "encrypted": ".env.enc"
+    },
+    "production": {
+      "source": ".env",
+      "encrypted": ".env.enc.production"
+    },
+    "staging": {
+      "source": ".env",
+      "encrypted": ".env.enc.staging"
+    }
+  }
+}
