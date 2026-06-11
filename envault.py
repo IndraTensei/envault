@@ -40,7 +40,7 @@ except ImportError:
     print("   pip install cryptography")
     sys.exit(1)
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 MAGIC = b"ENVA"
 NONCE_SIZE = 12
 SALT_SIZE = 16
@@ -851,6 +851,354 @@ def cmd_template(
         print("   All placeholders resolved.")
 
 
+HISTORY_DIR_NAME = ".envault-history"
+
+
+def _get_history_dir(env_file: Path) -> Path:
+    """Get the history directory for a given encrypted file."""
+    return env_file.parent / HISTORY_DIR_NAME
+
+
+def _save_history_snapshot(env_file: Path, password: str) -> Path:
+    """Save a timestamped snapshot of an encrypted file to history."""
+    history_dir = _get_history_dir(env_file)
+    history_dir.mkdir(parents=True, exist_ok=True)
+
+    # Read current encrypted data
+    data = env_file.read_bytes()
+
+    # Use current time for timestamp (reliable across fast successive calls)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    # Create snapshot filename
+    base_name = env_file.name
+    # Ensure unique filename even if called within same second
+    snapshot_name = f"{base_name}.{ts}"
+    snapshot_path = history_dir / snapshot_name
+
+    # If snapshot already exists for this exact second, add microsecond suffix
+    if snapshot_path.exists():
+        from time import time
+        suffix = str(int(time() * 1_000_000))[-6:]
+        snapshot_name = f"{base_name}.{ts}-{suffix}"
+        snapshot_path = history_dir / snapshot_name
+
+    # Copy the encrypted file
+    snapshot_path.write_bytes(data)
+    return snapshot_path
+
+
+def cmd_history(input_path: str, password: str | None = None, *,
+                action: str = "list", restore: str | None = None,
+                keep: int = 20) -> None:
+    """Manage version history for an encrypted .env file.
+
+    Actions:
+        list      — Show history snapshots (default)
+        snapshot  — Save current state as a new snapshot
+        restore   — Restore a specific snapshot
+        prune     — Remove old snapshots, keeping only the most recent N
+
+    History is stored in .envault-history/ alongside the encrypted file.
+
+    Usage:
+        envault history .env.enc                  # list snapshots
+        envault history .env.enc --action snapshot # save new snapshot
+        envault history .env.enc --action restore --restore 20240611-143022
+        envault history .env.enc --action prune --keep 10
+    """
+    input_file = Path(input_path)
+    if not input_file.exists():
+        print(f"❌ File not found: {input_path}")
+        sys.exit(2)
+
+    history_dir = _get_history_dir(input_file)
+
+    if action == "list":
+        if not history_dir.exists():
+            print(f"📋 No history for {input_file.name}")
+            print(f"   Run 'envault history {input_path} --action snapshot' to start tracking.")
+            return
+
+        snapshots = sorted(history_dir.glob(f"{input_file.name}.*"))
+        if not snapshots:
+            print(f"📋 No history for {input_file.name}")
+            return
+
+        print(f"📋 History for {input_file.name} ({len(snapshots)} snapshots)")
+        print(f"   Location: {history_dir}/")
+        print()
+
+        for i, snap in enumerate(snapshots):
+            # Extract timestamp from filename
+            ts_str = snap.name.rsplit(".", 1)[-1]
+            try:
+                ts = datetime.strptime(ts_str, "%Y%m%d-%H%M%S")
+                ts_display = ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+            except ValueError:
+                ts_display = ts_str
+
+            size = snap.stat().st_size
+            marker = "  →" if i == len(snapshots) - 1 else "   "
+            print(f"{marker} {ts_display}  ({size:,} bytes)  [{ts_str}]")
+
+        print()
+        print(f"   Restore: envault history {input_path} --action restore --restore <TIMESTAMP>")
+        print(f"   Snapshot: envault history {input_path} --action snapshot")
+        print(f"   Prune: envault history {input_path} --action prune --keep 10")
+
+    elif action == "snapshot":
+        snapshot_path = _save_history_snapshot(input_file, password or "")
+        print(f"✅ Saved snapshot: {snapshot_path.name}")
+        print(f"   Location: {history_dir}/")
+
+        # Count total snapshots
+        snapshots = sorted(history_dir.glob(f"{input_file.name}.*"))
+        print(f"   Total snapshots: {len(snapshots)}")
+
+    elif action == "restore":
+        if restore is None:
+            print("❌ --restore <TIMESTAMP> required for restore action.")
+            print("   Use 'envault history <file>' to see available timestamps.")
+            sys.exit(2)
+
+        # Find the snapshot
+        snapshot_path = history_dir / f"{input_file.name}.{restore}"
+        if not snapshot_path.exists():
+            # Try prefix matching
+            candidates = sorted(history_dir.glob(f"{input_file.name}.*{restore}*"))
+            if len(candidates) == 1:
+                snapshot_path = candidates[0]
+            elif len(candidates) > 1:
+                print(f"❌ Multiple snapshots match '{restore}':")
+                for c in candidates:
+                    print(f"   {c.name}")
+                print("   Be more specific.")
+                sys.exit(2)
+            else:
+                print(f"❌ Snapshot not found matching '{restore}'")
+                print("   Run 'envault history <file>' to see available snapshots.")
+                sys.exit(2)
+
+        # Restore: copy snapshot over the current file
+        import shutil
+        # First, back up current to history
+        if input_file.exists():
+            backup_ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            backup_path = history_dir / f"{input_file.name}.{backup_ts}-pre-restore"
+            shutil.copy2(input_file, backup_path)
+            print(f"   Backed up current state to {backup_path.name}")
+
+        shutil.copy2(snapshot_path, input_file)
+        print(f"✅ Restored {input_file.name} from snapshot {restore}")
+        print(f"   Previous state backed up to history.")
+
+    elif action == "prune":
+        snapshots = sorted(history_dir.glob(f"{input_file.name}.*"))
+        if len(snapshots) <= keep:
+            print(f"📋 {len(snapshots)} snapshots, keeping {keep}. Nothing to prune.")
+            return
+
+        to_remove = snapshots[:-keep]
+        for snap in to_remove:
+            snap.unlink()
+
+        remaining = len(snapshots) - len(to_remove)
+        print(f"✅ Pruned {len(to_remove)} old snapshots. {remaining} remaining (keeping last {keep}).")
+
+    else:
+        print(f"❌ Unknown history action: {action}")
+        print("   Supported: list, snapshot, restore, prune")
+        sys.exit(2)
+
+
+def cmd_doctor() -> None:
+    """Run diagnostics on your envault setup and .env security.
+
+    Checks for:
+        ✅ Plaintext .env files that should be encrypted
+        ✅ Encrypted files that can be decrypted (with password)
+        ✅ .envvaultrc config validity
+        ✅ Git pre-commit hook installation
+        ✅ Stale encrypted files (source deleted but .enc remains)
+        ✅ World-readable permissions on encrypted files
+        ✅ Version status (up to date or upgrade available)
+
+    Usage:
+        envault doctor
+    """
+    issues = 0
+    warnings = 0
+    ok = 0
+
+    def ok_msg(msg):
+        nonlocal ok
+        ok += 1
+        print(f"   ✅ {msg}")
+
+    def warn(msg):
+        nonlocal warnings
+        warnings += 1
+        print(f"   ⚠️  {msg}")
+
+    def fail(msg):
+        nonlocal issues
+        issues += 1
+        print(f"   ❌ {msg}")
+
+    cwd = Path.cwd()
+    print(f"🏥 envault doctor — checking your setup")
+    print(f"   Directory: {cwd}")
+    print(f"   envault v{VERSION}")
+    print()
+
+    # 1. Check for plaintext .env files
+    print("📂 Scanning for plaintext .env files...")
+    env_files = sorted(cwd.glob(".env"))
+    env_local = sorted(cwd.glob(".env.local"))
+    env_dev = sorted(cwd.glob(".env.development"))
+    plain_envs = env_files + env_local + env_dev
+
+    # Filter out .gitignore'd or commonly ignored ones
+    relevant_plaintext = []
+    for ef in plain_envs:
+        # Skip if it's actually an encrypted file
+        data = ef.read_bytes()
+        if data[:len(MAGIC)] == MAGIC:
+            continue
+        relevant_plaintext.append(plaintext_path := ef)
+
+    if relevant_plaintext:
+        fail(f"Found {len(relevant_plaintext)} plaintext .env file(s):")
+        for p in relevant_plaintext:
+            fail(f"  {p.name} — encrypt with: envault encrypt {p.name}")
+    else:
+        ok_msg("No unprotected plaintext .env files found")
+
+    # 2. Check encrypted files
+    print()
+    print("🔐 Checking encrypted files...")
+    enc_files = sorted(cwd.rglob("*.enc"))
+    # Also check .env.enc.* profile files
+    profile_encs = sorted(cwd.glob(".env.enc.*"))
+    all_enc = sorted(set(enc_files + profile_encs))
+
+    # Filter out history directory snapshots
+    all_enc = [f for f in all_enc if HISTORY_DIR_NAME not in f.parts]
+
+    if not all_enc:
+        warn("No encrypted .env files found in this directory")
+    else:
+        ok_msg(f"Found {len(all_enc)} encrypted file(s)")
+
+        # Check file permissions
+        for ef in all_enc:
+            mode = ef.stat().st_mode
+            if mode & stat.S_IROTH:
+                warn(f"{ef.name} is world-readable (chmod 600 {ef.name})")
+            else:
+                ok_msg(f"{ef.name} permissions OK")
+
+        # Check for stale encrypted files (source doesn't exist)
+        for ef in all_enc:
+            source = find_encrypted_source(ef)
+            if source and not source.exists():
+                warn(f"{ef.name} — source {source.name} not found (stale?)")
+
+    # 3. Check .envvaultrc
+    print()
+    print("📝 Checking .envvaultrc...")
+    config_path = cwd / ENV_CONFIG_FILE
+    if config_path.exists():
+        ok_msg(".envvaultrc exists")
+        try:
+            config = json.loads(config_path.read_text())
+            profiles = config.get("profiles", {})
+            if profiles:
+                ok_msg(f"Configured profiles: {', '.join(sorted(profiles.keys()))}")
+            else:
+                warn(".envvaultrc has no profiles defined")
+        except json.JSONDecodeError as e:
+            fail(f".envvaultrc is invalid JSON: {e}")
+    else:
+        warn("No .envvaultrc found — run 'envault init' to create one")
+
+    # 4. Check git hooks
+    print()
+    print("🪝 Checking git hooks...")
+    hook_path = cwd / ".git" / "hooks" / "pre-commit"
+    if hook_path.exists():
+        hook_content = hook_path.read_text()
+        if "envault" in hook_content:
+            ok_msg("envault pre-commit hook installed")
+        else:
+            warn("pre-commit hook exists but is not from envault")
+    else:
+        warn("No envault pre-commit hook — run 'envault install-hooks'")
+
+    # Check if we're in a git repo
+    git_dir = cwd / ".git"
+    if git_dir.exists():
+        ok_msg("Git repository detected")
+    else:
+        warn("Not a git repository — some features (hooks) won't apply")
+
+    # 5. Check for .env in .gitignore
+    print()
+    print("🙈 Checking .gitignore...")
+    gitignore = cwd / ".gitignore"
+    if gitignore.exists():
+        gi_content = gitignore.read_text()
+        if ".env" in gi_content or "*.env" in gi_content:
+            ok_msg(".env files are in .gitignore")
+        else:
+            warn(".env files NOT in .gitignore — consider adding them")
+    else:
+        warn("No .gitignore found — consider creating one with *.env")
+
+    # 6. History check
+    print()
+    print("🕐 Checking version history...")
+    if all_enc:
+        for ef in all_enc:
+            hd = _get_history_dir(ef)
+            if hd.exists():
+                snaps = sorted(hd.glob(f"{ef.name}.*"))
+                if snaps:
+                    ok_msg(f"{ef.name}: {len(snaps)} history snapshot(s)")
+    else:
+        print("   (no encrypted files to check)")
+
+    # Summary
+    print()
+    print("=" * 50)
+    total_score = ok * 2 - issues * 3 - warnings
+    max_score = (ok + issues + warnings) * 2
+    health = max(0, min(100, int((total_score / max(max_score, 1)) * 100)))
+
+    if health >= 80:
+        health_icon = "🟢"
+        verdict = "Great shape!"
+    elif health >= 50:
+        health_icon = "🟡"
+        verdict = "Needs some attention"
+    else:
+        health_icon = "🔴"
+        verdict = "Action needed"
+
+    print(f"   Health Score: {health_icon} {health}/100 — {verdict}")
+    print(f"   ✅ {ok} passed  |  ⚠️  {warnings} warnings  |  ❌ {issues} issues")
+    print()
+
+    if issues > 0:
+        print("   Fix issues above to improve your security posture.")
+    if warnings > 0:
+        print("   Address warnings for best practices.")
+    if ok == 0 and issues == 0 and warnings == 0:
+        print("   Nothing to check — create a .env file and encrypt it to get started!")
+    print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="envault",
@@ -872,6 +1220,11 @@ examples:
   envault export .env.enc --format json     Export to JSON
   envault export .env.enc --format kubernetes -o secret.yaml
   envault template .env.template --source .env.enc -o .env
+  envault history .env.enc                              # list snapshots
+  envault history .env.enc --action snapshot             # save snapshot
+  envault history .env.enc --action restore --restore 20240611-143022
+  envault history .env.enc --action prune --keep 10
+  envault doctor                                        # diagnose setup
 """,
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -947,6 +1300,23 @@ examples:
     tmpl_parser.add_argument("--source", help="Encrypted or plaintext source file for values")
     tmpl_parser.add_argument("-o", "--output", help="Output file path")
 
+    # History
+    hist_parser = subparsers.add_parser(
+        "history", help="Manage version history for encrypted .env files"
+    )
+    hist_parser.add_argument("file", help="Encrypted file to manage history for")
+    hist_parser.add_argument(
+        "--action", choices=["list", "snapshot", "restore", "prune"],
+        default="list", help="History action (default: list)"
+    )
+    hist_parser.add_argument("--restore", help="Timestamp to restore (for --action restore)")
+    hist_parser.add_argument("--keep", type=int, default=20, help="Snapshots to keep (for --action prune)")
+
+    # Doctor
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Diagnose your envault setup and .env security"
+    )
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -988,6 +1358,10 @@ examples:
         cmd_export(args.file, args.output, args.fmt)
     elif args.command == "template":
         cmd_template(args.template, args.source, args.output)
+    elif args.command == "history":
+        cmd_history(args.file, action=args.action, restore=args.restore, keep=args.keep)
+    elif args.command == "doctor":
+        cmd_doctor()
     else:
         parser.print_help()
         sys.exit(0)

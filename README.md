@@ -22,6 +22,8 @@ Because `*.env` in `.gitignore` is easy to forget. And secrets in git history? T
 - **Password strength meter** — real-time feedback on encryption password quality
 - **Multi-format export** — export encrypted env vars to JSON, YAML, shell, Docker, or Kubernetes
 - **Template rendering** — generate `.env` files from `.env.template` using encrypted secrets
+- **Version history** — snapshot, list, restore, and prune encrypted file versions with `envault history`
+- **Doctor diagnostics** — `envault doctor` audits your entire setup for security issues and best practices
 
 ## Installation
 
@@ -96,6 +98,8 @@ envault template .env.template --source .env.enc.production -o .env
 | `watch <file> [--interval N]` | Auto re-encrypt on change |
 | `export <file> [--format FMT] [-o out]` | Export to JSON/YAML/shell/Docker/K8s/dotenv |
 | `template <tpl> --source <src> [-o out]` | Render .env.template from encrypted values |
+| `history <file> [--action ACTION]` | Manage version history (list/snapshot/restore/prune) |
+| `doctor` | Diagnose setup and security health |
 
 ## Multi-Profile Workflow
 
@@ -172,6 +176,71 @@ envault template .env.template --source .env.enc.production -o .env
 ```
 
 This is perfect for onboarding — commit the template to git, share the encrypted file securely, and new team members can generate their `.env` without ever seeing the password.
+
+## Version History
+
+`envault history` keeps a versioned backup of your encrypted `.env` files so you can roll back mistakes:
+
+```bash
+# Save a snapshot of the current encrypted file
+envault history .env.enc --action snapshot
+
+# List all snapshots
+envault history .env.enc
+# 📋 History for .env.enc (3 snapshots)
+#    Location: .envvault-history/
+#
+#      2024-06-09 10:00:00 UTC  (1,234 bytes)  [20240609-100000]
+#      2024-06-10 14:30:00 UTC  (1,245 bytes)  [20240610-143000]
+#   →  2024-06-11 09:15:00 UTC  (1,250 bytes)  [20240611-091500]
+
+# Restore a specific snapshot (current state is auto-backed up first)
+envault history .env.enc --action restore --restore 20240610-143000
+
+# Prune old snapshots, keeping only the most recent 10
+envault history .env.enc --action prune --keep 10
+```
+
+Snapshots are stored in `.envault-history/` alongside your encrypted file. The current state is always backed up before a restore, so you can never lose data.
+
+## Doctor Diagnostics
+
+`envault doctor` is your security health check. Run it to audit your entire setup:
+
+```bash
+envault doctor
+# 🏥 envault doctor — checking your setup
+#    Directory: /home/user/myproject
+#    envault v1.3.0
+#
+# 📂 Scanning for plaintext .env files...
+#    ✅ No unprotected plaintext .env files found
+#
+# 🔐 Checking encrypted files...
+#    ✅ Found 2 encrypted file(s)
+#    ✅ .env.enc permissions OK
+#    ⚠️  .env.enc.staging is world-readable (chmod 600 .env.enc.staging)
+#
+# 📝 Checking .envvaultrc...
+#    ✅ .envvaultrc exists
+#    ✅ Configured profiles: production, staging
+#
+# 🪝 Checking git hooks...
+#    ✅ envault pre-commit hook installed
+#    ✅ Git repository detected
+#
+# 🙈 Checking .gitignore...
+#    ✅ .env files are in .gitignore
+#
+# 🕐 Checking version history...
+#    ✅ .env.enc: 3 history snapshot(s)
+#
+# ==================================================
+#    Health Score: 🟢 92/100 — Great shape!
+#    ✅ 7 passed  |  ⚠️  1 warnings  |  ❌ 0 issues
+```
+
+It checks for plaintext `.env` leaks, file permissions, config validity, git hook installation, `.gitignore` coverage, and version history — then gives you a health score.
 
 ## Password Strength Feedback
 

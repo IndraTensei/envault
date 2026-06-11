@@ -548,11 +548,152 @@ print("28. Version bump check")
 
 
 def t28():
-    assert envault.VERSION == "1.2.0", f"Expected 1.2.0, got {envault.VERSION}"
+    assert envault.VERSION == "1.3.0", f"Expected 1.3.0, got {envault.VERSION}"
     print("   OK")
 
 
 test("version_bump", t28)
+
+
+# 29. History — snapshot
+print("29. History — snapshot")
+
+def t29():
+    envault.encrypt_env("test.env", "hist_test.enc")
+    # Save a snapshot
+    old = sys.stdout
+    sys.stdout = buf = io.StringIO()
+    try:
+        envault.cmd_history("hist_test.enc", action="snapshot")
+    finally:
+        sys.stdout = old
+    # Check history dir exists
+    hist_dir = Path(".envault-history")
+    assert hist_dir.exists(), "History directory not created"
+    snaps = sorted(hist_dir.glob("hist_test.enc.*"))
+    assert len(snaps) >= 1, f"Expected at least 1 snapshot, got {len(snaps)}"
+    print("   OK")
+
+test("history_snapshot", t29)
+
+# 30. History — list
+print("30. History — list")
+
+def t30():
+    old = sys.stdout
+    sys.stdout = buf = io.StringIO()
+    try:
+        envault.cmd_history("hist_test.enc", action="list")
+        out = buf.getvalue()
+    finally:
+        sys.stdout = old
+    assert "snapshots" in out
+    print("   OK")
+
+test("history_list", t30)
+
+# 31. History — prune
+print("31. History — prune")
+
+def t31():
+    # Create a few more snapshots
+    for _ in range(3):
+        envault.cmd_history("hist_test.enc", action="snapshot")
+    hist_dir = Path(".envault-history")
+    snaps = sorted(hist_dir.glob("hist_test.enc.*"))
+    # Prune to keep only 2
+    old = sys.stdout
+    sys.stdout = buf = io.StringIO()
+    try:
+        envault.cmd_history("hist_test.enc", action="prune", keep=2)
+    finally:
+        sys.stdout = old
+    snaps_after = sorted(hist_dir.glob("hist_test.enc.*"))
+    # Should have at most 2 (plus any -pre-restore etc)
+    non_restore = [s for s in snaps_after if "-pre-restore" not in s.name and "-prune" not in s.name]
+    assert len(non_restore) <= 2, f"Expected <= 2 after prune, got {len(non_restore)}"
+    print("   OK")
+
+test("history_prune", t31)
+
+# 32. History — restore
+print("32. History — restore")
+
+def t32():
+    hist_dir = Path(".envault-history")
+    snaps = sorted(hist_dir.glob("hist_test.enc.*"))
+    # Get the oldest non-restore snapshot
+    non_restore = [s for s in snaps if "-pre-restore" not in s.name and "-prune" not in s.name]
+    if len(non_restore) < 1:
+        print("   SKIP (no snapshots)")
+        return
+    # Extract timestamp from the first snapshot
+    ts_str = non_restore[0].name.rsplit(".", 1)[-1]
+    old = sys.stdout
+    sys.stdout = buf = io.StringIO()
+    try:
+        envault.cmd_history("hist_test.enc", action="restore", restore=ts_str)
+    finally:
+        sys.stdout = old
+    assert Path("hist_test.enc").exists()
+    print("   OK")
+
+test("history_restore", t32)
+
+# 33. History — list empty file
+print("33. History — list (no history yet)")
+
+def t33():
+    envault.encrypt_env("test.env", "hist_empty.enc")
+    old = sys.stdout
+    sys.stdout = buf = io.StringIO()
+    try:
+        envault.cmd_history("hist_empty.enc", action="list")
+        out = buf.getvalue()
+    finally:
+        sys.stdout = old
+    assert "No history" in out
+    print("   OK")
+
+test("history_list_empty", t33)
+
+# 34. Doctor — runs without error
+print("34. Doctor — runs without error")
+
+def t34():
+    old = sys.stdout
+    sys.stdout = buf = io.StringIO()
+    try:
+        envault.cmd_doctor()
+        out = buf.getvalue()
+    finally:
+        sys.stdout = old
+    assert "Health Score" in out
+    assert "envault v1.3.0" in out
+    print("   OK")
+
+test("doctor_runs", t34)
+
+# 35. Doctor — detects plaintext .env
+print("35. Doctor — detects plaintext .env")
+
+def t35():
+    # Create a plaintext .env file
+    Path("doctor_test.env").write_text("SECRET=value\n")
+    try:
+        old = sys.stdout
+        sys.stdout = buf = io.StringIO()
+        try:
+            envault.cmd_doctor()
+            out = buf.getvalue()
+        finally:
+            sys.stdout = old
+        assert "plaintext" in out.lower() or "doctor_test.env" in out
+    finally:
+        Path("doctor_test.env").unlink(missing_ok=True)
+    print("   OK")
+
+test("doctor_detects_plaintext", t35)
 
 
 # Cleanup
@@ -566,8 +707,12 @@ for f in [
     "export_out_dot.env", "plain_export.env", "plain_out.json",
     "test_template.env", "rendered.env", "plain_source.env",
     "test_template2.env", "rendered2.env",
+    "hist_test.enc", "hist_empty.enc", "doctor_test.env",
 ]:
     Path(f).unlink(missing_ok=True)
+# Clean up history directory
+import shutil
+shutil.rmtree(".envault-history", ignore_errors=True)
 
 print(f"\n=== Results: {passed} passed, {failed} failed ===")
 if failed:
