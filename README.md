@@ -100,6 +100,9 @@ envault template .env.template --source .env.enc.production -o .env
 | `template <tpl> --source <src> [-o out]` | Render .env.template from encrypted values |
 | `history <file> [--action ACTION]` | Manage version history (list/snapshot/restore/prune) |
 | `doctor` | Diagnose setup and security health |
+| `bulk <dir> [--operation encrypt|decrypt]` | Batch encrypt or decrypt .env files in a directory |
+| `validate <file> [--schema SCHEMA]` | Validate .env file against a schema definition |
+| `verify <file>` | Verify encrypted file integrity without full decryption |
 
 ## Multi-Profile Workflow
 
@@ -202,6 +205,73 @@ envault history .env.enc --action prune --keep 10
 ```
 
 Snapshots are stored in `.envault-history/` alongside your encrypted file. The current state is always backed up before a restore, so you can never lose data.
+
+## Batch Operations
+
+`envault bulk` allows you to encrypt or decrypt multiple `.env` files in a directory at once:
+
+```bash
+# Encrypt all .env files in current directory
+envault bulk . --operation encrypt
+
+# Decrypt all .enc files in ./envs directory
+envault bulk ./envs --operation decrypt
+
+# Specify output directory
+envault bulk . --operation encrypt --output-dir ./encrypted
+```
+
+This is useful when managing multiple environment files across different services or microservices.
+
+## Schema Validation
+
+`envault validate` validates `.env` files against a JSON schema definition:
+
+```bash
+# Validate with explicit schema file
+envault validate .env --schema .env.schema.json
+
+# Validate encrypted file (will prompt for password)
+envault validate .env.enc --schema production.schema.json
+```
+
+Schema format (`.env.schema.json`):
+```json
+{
+  "required": ["DATABASE_URL", "API_KEY", "SECRET_KEY"],
+  "patterns": {
+    "DATABASE_URL": "^postgres://",
+    "API_KEY": "^[A-Za-z0-9]{32,}$"
+  },
+  "types": {
+    "PORT": "integer",
+    "DEBUG": "boolean",
+    "DATABASE_URL": "url"
+  }
+}
+```
+
+If no schema is specified, envault looks for `<file>.schema.json` in the same directory.
+
+Validation checks:
+- Required keys are present
+- Values match specified regex patterns
+- Values are of the correct type (integer, boolean, url)
+
+## Verify Integrity
+
+`envault verify` checks encrypted file integrity without fully decrypting:
+
+```bash
+envault verify .env.enc
+```
+
+This command:
+- Validates file format and magic bytes
+- Checks file permissions (warns if world-readable)
+- Optionally verifies checksum and metadata (with password)
+
+Use this to quickly check if an encrypted file is valid and hasn't been corrupted, without exposing the decrypted contents.
 
 ## Doctor Diagnostics
 

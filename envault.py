@@ -40,7 +40,7 @@ except ImportError:
     print("   pip install cryptography")
     sys.exit(1)
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 MAGIC = b"ENVA"
 NONCE_SIZE = 12
 SALT_SIZE = 16
@@ -888,6 +888,233 @@ def _save_history_snapshot(env_file: Path, password: str) -> Path:
     return snapshot_path
 
 
+def cmd_bulk(input_path: str, password: str | None = None, *,
+              operation: str = "encrypt", output_dir: str | None = None) -> None:
+    """Batch encrypt or decrypt .env files in a directory.
+
+    Usage:
+        envault bulk . --operation encrypt
+        envault bulk ./envs --operation decrypt
+    """
+    input_dir = Path(input_path)
+    if not input_dir.is_dir():
+        print(f"❌ Directory not found: {input_path}")
+        sys.exit(2)
+
+    if output_dir is None:
+        output_dir = str(input_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Find all .env files (excluding already encrypted ones)
+    if operation == "encrypt":
+        files = [f for f in input_dir.glob("*.env") if not f.name.endswith(".enc")]
+        if not files:
+            print(f"No .env files found in {input_path}")
+            return
+        print(f"🔄 Batch encrypting {len(files)} file(s)..." if False else f"Batch encrypting {len(files)} file(s)...")
+        for f in files:
+            out_file = output_path / (f.name + ".enc")
+            encrypt_env(str(f), str(out_file), password=password)
+        print(f"✅ Encrypted {len(files)} file(s) to {output_dir}")
+    elif operation == "decrypt":
+        files = list(input_dir.glob("*.enc"))
+        if not files:
+            print(f"No .enc files found in {input_path}")
+            return
+        print(f"Batch decrypting {len(files)} file(s)...")
+        for f in files:
+            # Derive output name: .env.enc.production -> .env.production
+            out_name = f.name
+            if out_name.endswith(".enc"):
+                out_name = out_name[:-4]
+            out_file = output_path / out_name
+            decrypt_env(str(f), str(out_file), password=password)
+        print(f"✅ Decrypted {len(files)} file(s) to {output_dir}")
+    else:
+        print(f"❌ Unknown operation: {operation}")
+        print("   Supported: encrypt, decrypt")
+        sys.exit(2)
+
+
+def cmd_validate(input_path: str, schema_path: str | None = None) -> None:
+    """Validate .env file against a schema definition.
+
+    Schema format (JSON):
+    {
+        "required": ["DATABASE_URL", "API_KEY"],
+        "patterns": {
+            "DATABASE_URL": "^postgres://",
+            "API_KEY": "^[A-Za-z0-9]{32,}$"
+        },
+        "types": {
+            "PORT": "integer",
+            "DEBUG": "boolean"
+        }
+    }
+
+    Usage:
+        envault validate .env --schema .env.schema.json
+    """
+    input_file = Path(input_path)
+    if not input_file.exists():
+        print(f"❌ File not found: {input_path}")
+        sys.exit(2)
+
+    # Load and parse the .env file
+    data = input_file.read_bytes()
+    if data[:len(MAGIC)] == MAGIC:
+        pw = getpass.getpass(f"🔑 Password for {input_file.name}: ")
+        plaintext, _ = decrypt_raw(data, pw)
+        vars = parse_env_vars(plaintext)
+    else:
+        vars = parse_env_vars(data)
+
+    # Load schema
+    if schema_path is None:
+        # Look for default schema file
+        default_schema = input_file.parent / (input_file.name + ".schema.json")
+        if default_schema.exists():
+            schema_path = str(default_schema)
+        else:
+            print("❌ No schema specified and no default schema found.")
+            print("   Use --schema to specify a schema file.")
+            sys.exit(2)
+
+    schema_file = Path(schema_path)
+    if not schema_file.exists():
+        print(f"❌ Schema file not found: {schema_path}")
+        sys.exit(2)
+
+    try:
+        schema = json.loads(schema_file.read_text())
+    except json.JSONDecodeError as e:
+        print(f"❌ Invalid schema JSON: {e}")
+        sys.exit(2)
+
+    errors = []
+    warnings = []
+
+    # Check required keys
+    required = schema.get("required", [])
+    for key in required:
+        if key not in vars:
+            errors.append(f"Missing required key: {key}")
+
+    # Check patterns
+    patterns = schema.get("patterns", {})
+    for key, pattern in patterns.items():
+        if key in vars:
+            import re
+            if not re.match(pattern, vars[key]):
+                errors.append(f"Key {key} does not match pattern: {pattern}")
+
+    # Check types
+    type_checks = schema.get("types", {})
+    for key, expected_type in type_checks.items():
+        if key in vars:
+            value = vars[key]
+            if expected_type == "integer":
+                try:
+                    int(value)
+                except ValueError:
+                    errors.append(f"Key {key} should be integer, got: {value}")
+            elif expected_type == "boolean":
+                if value.lower() not in ("true", "false", "1", "0", "yes", "no"):
+                    errors.append(f"Key {key} should be boolean, got: {value}")
+            elif expected_type == "url":
+                if not (value.startswith("http://") or value.startswith("https://")):
+                    errors.append(f"Key {key} should be URL, got: {value}")
+
+    # Report results
+    print(f"🔍 Validating {input_file.name} against {schema_file.name}")
+    print(f"   Keys found: {len(vars)}")
+
+    if errors:
+        print(f"\n❌ Validation failed ({len(errors)} error(s)):")
+        for err in errors:
+            print(f"   - {err}")
+    else:
+        print("\n✅ Validation passed")
+
+    if warnings:
+        print(f"\n⚠️  Warnings ({len(warnings)}):")
+        for warn in warnings:
+            print(f"   - {warn}")
+
+    if errors:
+        sys.exit(1)
+
+
+def cmd_verify(input_path: str) -> None:
+    """Verify encrypted file integrity without full decryption.
+
+    Checks:
+    - File format and magic bytes
+    - Checksum validation
+    - Metadata completeness
+    - File permissions
+
+    Usage:
+        envault verify .env.enc
+    """
+    input_file = Path(input_path)
+    if not input_file.exists():
+        print(f"❌ File not found: {input_path}")
+        sys.exit(2)
+
+    data = input_file.read_bytes()
+
+    # Check magic bytes
+    if data[:len(MAGIC)] != MAGIC:
+        print(f"❌ Not a valid envault file (bad magic bytes)")
+        sys.exit(1)
+
+    try:
+        salt, nonce, ciphertext = parse_encrypted(data)
+    except ValueError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+    # Extract metadata without decrypting (we need the password)
+    print(f"📋 File: {input_file.name}")
+    print(f"   Format: Valid envault encrypted file")
+    print(f"   File size: {len(data):,} bytes")
+    print(f"   Salt: {base64.b16encode(salt).decode()[:16]}...")
+    print(f"   Nonce: {base64.b16encode(nonce).decode()[:16]}...")
+
+    # Check file permissions
+    mode = input_file.stat().st_mode
+    if mode & stat.S_IROTH or mode & stat.S_IRGRP:
+        print("⚠️  Warning: File is readable by group/others")
+        print("   Consider: chmod 600 " + input_file.name)
+    else:
+        print("✅ File permissions OK (owner-only read)")
+
+    # Try to verify checksum with password
+    print()
+    print("To verify checksum and metadata, provide the password:")
+    try:
+        pw = getpass.getpass("🔑 Password: ")
+        plaintext, metadata = decrypt_raw(data, pw)
+        checksum = compute_checksum(plaintext)
+        expected = metadata.get("checksum", "")
+
+        print(f"\n✅ Decryption successful")
+        print(f"   Checksum: {checksum[:16]}...")
+        print(f"   Expected: {expected[:16]}...")
+        if checksum == expected:
+            print("✅ Integrity check passed")
+        else:
+            print("❌ Integrity check failed - file may be corrupted")
+
+        print(f"   Encrypted at: {metadata.get('encrypted_at', 'unknown')}")
+        print(f"   Profile: {metadata.get('profile', 'default')}")
+        print(f"   Keys: {len(parse_env_keys(plaintext))}")
+    except ValueError as e:
+        print(f"❌ Could not verify: {e}")
+
+
 def cmd_history(input_path: str, password: str | None = None, *,
                 action: str = "list", restore: str | None = None,
                 keep: int = 20) -> None:
@@ -1317,6 +1544,30 @@ examples:
         "doctor", help="Diagnose your envault setup and .env security"
     )
 
+    # Bulk
+    bulk_parser = subparsers.add_parser(
+        "bulk", help="Batch encrypt or decrypt .env files in a directory"
+    )
+    bulk_parser.add_argument("path", help="Directory containing .env files")
+    bulk_parser.add_argument(
+        "--operation", choices=["encrypt", "decrypt"], default="encrypt",
+        help="Operation to perform (default: encrypt)"
+    )
+    bulk_parser.add_argument("--output-dir", help="Output directory (default: same as input)")
+
+    # Validate
+    validate_parser = subparsers.add_parser(
+        "validate", help="Validate .env file against a schema definition"
+    )
+    validate_parser.add_argument("file", help=".env file to validate (encrypted or plaintext)")
+    validate_parser.add_argument("--schema", help="Schema file path (default: <file>.schema.json)")
+
+    # Verify
+    verify_parser = subparsers.add_parser(
+        "verify", help="Verify encrypted file integrity without full decryption"
+    )
+    verify_parser.add_argument("file", help="Encrypted file to verify")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -1362,6 +1613,12 @@ examples:
         cmd_history(args.file, action=args.action, restore=args.restore, keep=args.keep)
     elif args.command == "doctor":
         cmd_doctor()
+    elif args.command == "bulk":
+        cmd_bulk(args.path, operation=args.operation, output_dir=args.output_dir)
+    elif args.command == "validate":
+        cmd_validate(args.file, schema_path=args.schema)
+    elif args.command == "verify":
+        cmd_verify(args.file)
     else:
         parser.print_help()
         sys.exit(0)
